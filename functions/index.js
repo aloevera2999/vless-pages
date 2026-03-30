@@ -9,20 +9,22 @@ import { connect } from 'cloudflare:sockets';
 // UUID 配置
 const UUID = '14694400-88b4-4c77-9072-adfb729652cd';
 
-// 默认代理IP
-let proxyIP = 'cdn.anycast.eu.org';
+// 默认代理IP - 使用日本节点（51ms延迟）
+let proxyIP = '162.159.201.1';
 
 // 连接超时设置（毫秒）
 const CONNECT_TIMEOUT = 10000;
 const SOCKET_TIMEOUT = 30000;
 
-// 备用代理IP列表
+// 备用代理IP列表（按速度排序）
 const backupProxyIPs = [
-    'cdn.anycast.eu.org',
-    '162.159.136.1',
-    '1.1.1.1',
-    '8.8.8.8',
-    '9.9.9.9'
+    '162.159.201.1',  // 日本节点 - 51ms（最快）
+    '162.159.195.1',  // 香港节点 - 169ms
+    '162.159.204.1',  // 新加坡节点 - 152ms
+    '162.159.138.1',  // 通用节点 - 145ms
+    '162.159.137.1',  // 通用节点 - 155ms
+    '1.1.1.1',        // Cloudflare DNS
+    '8.8.8.8'         // Google DNS
 ];
 
 // DNS服务器
