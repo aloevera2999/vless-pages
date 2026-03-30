@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VLESS Proxy - Pages Functions</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 600px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        .header h1 {
+            color: #333;
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            color: #666;
+            font-size: 14px;
+        }
+        
+        .status {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px 0;
+            border-bottom: 1px solid #e9ecef;
+        }
+        
+        .status-item:last-child {
+            border-bottom: none;
+        }
+        
+        .status-label {
+            color: #666;
+            font-weight: 500;
+        }
+        
+        .status-value {
+            color: #333;
+            font-weight: 600;
+        }
+        
+        .status-value.success {
+            color: #28a745;
+        }
+        
+        .config {
+            background: #28a745;
+            color: white;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .config h2 {
+            font-size: 18px;
+            margin-bottom: 15px;
+        }
+        
+        .config-code {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 15px;
+            border-radius: 5px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            word-break: break-all;
+            line-height: 1.6;
+        }
+        
+        .copy-btn {
+            background: white;
+            color: #28a745;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: 600;
+            margin-top: 10px;
+            width: 100%;
+            transition: all 0.3s;
+        }
+        
+        .copy-btn:hover {
+            background: #f8f9fa;
+            transform: translateY(-2px);
+        }
+        
+        .endpoints {
+            margin-top: 30px;
+        }
+        
+        .endpoint {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 10px;
+        }
+        
+        .endpoint h3 {
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 8px;
+        }
+        
+        .endpoint code {
+            background: #e9ecef;
+            padding: 8px 12px;
+            border-radius: 5px;
+            display: block;
+            font-size: 13px;
+            color: #d63384;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #666;
+        }
+        
+        @media (max-width: 600px) {
+            .container {
+                padding: 20px;
+            }
+            
+            .header h1 {
+                font-size: 24px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 VLESS Proxy</h1>
+            <p>Cloudflare Pages Functions</p>
+        </div>
+        
+        <div id="status" class="status">
+            <div class="loading">正在加载状态信息...</div>
+        </div>
+        
+        <div class="config">
+            <h2>📱 客户端配置</h2>
+            <div class="config-code" id="vless-link">
+                vless://14694400-88b4-4c77-9072-adfb729652cd@vless.lee-proxy.xyz:443?encryption=none&security=tls&sni=vless.lee-proxy.xyz&fp=randomized&type=ws&host=vless.lee-proxy.xyz&path=%2F%3Fed%3D2048#VLESS-Pages-Functions
+            </div>
+            <button class="copy-btn" onclick="copyConfig()">📋 复制 VLESS 链接</button>
+        </div>
+        
+        <div class="endpoints">
+            <div class="endpoint">
+                <h3>健康检查</h3>
+                <code>GET /</code>
+            </div>
+            <div class="endpoint">
+                <h3>配置信息</h3>
+                <code>GET /config</code>
+            </div>
+            <div class="endpoint">
+                <h3>连接测试</h3>
+                <code>GET /connect</code>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // 加载状态信息
+        async function loadStatus() {
+            try {
+                const response = await fetch('/');
+                const data = await response.json();
+                
+                document.getElementById('status').innerHTML = `
+                    <div class="status-item">
+                        <span class="status-label">状态</span>
+                        <span class="status-value success">✓ ${data.status}</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">版本</span>
+                        <span class="status-value">${data.version}</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">域名</span>
+                        <span class="status-value">${data.domain}</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">时间</span>
+                        <span class="status-value">${new Date(data.time).toLocaleString('zh-CN')}</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">服务</span>
+                        <span class="status-value">${data.service}</span>
+                    </div>
+                `;
+            } catch (error) {
+                document.getElementById('status').innerHTML = `
+                    <div class="status-item">
+                        <span class="status-label">状态</span>
+                        <span class="status-value" style="color: #dc3545;">✗ 加载失败</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">错误</span>
+                        <span class="status-value">${error.message}</span>
+                    </div>
+                `;
+            }
+        }
+        
+        // 复制配置
+        function copyConfig() {
+            const config = document.getElementById('vless-link').textContent;
+            navigator.clipboard.writeText(config).then(() => {
+                const btn = document.querySelector('.copy-btn');
+                const originalText = btn.textContent;
+                btn.textContent = '✓ 已复制！';
+                btn.style.background = '#ffc107';
+                
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                    btn.style.background = 'white';
+                }, 2000);
+            }).catch(err => {
+                alert('复制失败，请手动复制');
+            });
+        }
+        
+        // 页面加载时执行
+        loadStatus();
+        
+        // 每 30 秒刷新一次状态
+        setInterval(loadStatus, 30000);
+    </script>
+</body>
+</html>

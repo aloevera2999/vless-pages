@@ -1,0 +1,23 @@
+{
+  "name": "vless-pages-functions",
+  "version": "1.0.0",
+  "description": "VLESS Proxy on Cloudflare Pages Functions",
+  "main": "functions/api/[[path]].js",
+  "scripts": {
+    "dev": "wrangler pages dev --compatibility-date=2024-01-01 -- npm run start",
+    "start": "echo 'Pages Functions running'",
+    "deploy": "wrangler pages deploy . --project-name=vless-lee-proxy",
+    "tail": "wrangler pages deployment tail --project-name=vless-lee-proxy"
+  },
+  "keywords": [
+    "vless",
+    "proxy",
+    "cloudflare",
+    "pages-functions"
+  ],
+  "author": "Jokerlee2020",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
