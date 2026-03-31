@@ -1,47 +1,103 @@
 /**
- * VLESS Proxy - Cloudflare Pages Functions
- * 完整的 VLESS 协议实现
+ * VLESS Proxy with Twitter/X Support
+ * 增强版：支持主动 ProxyIP 模式
+ * 
+ * 关键改进：
+ * 1. 所有流量优先通过 ProxyIP 出口（解决 Twitter/X 封禁 CF IP 问题）
+ * 2. 支持环境变量配置 ProxyIP
+ * 3. 失败时自动切换备用 ProxyIP
  */
 
 // @ts-ignore
 import { connect } from 'cloudflare:sockets';
 
-// UUID 配置
-const UUID = '14694400-88b4-4c77-9072-adfb729652cd';
+// ==================== 配置区域 ====================
 
-// 默认代理IP - 使用日本节点（51ms延迟）
-let proxyIP = '162.159.201.1';
+// UUID - 从环境变量读取，如未设置则使用默认值
+const UUID = globalThis.UUID || '14694400-88b4-4c77-9072-adfb729652cd';
 
-// 连接超时设置（毫秒）
+// 主动 ProxyIP 模式开关
+// true: 所有流量都通过 ProxyIP 出口（推荐用于访问 Twitter/X）
+// false: 仅在直连失败时使用 ProxyIP
+const FORCE_PROXY_MODE = globalThis.FORCE_PROXY_MODE !== 'false'; // 默认开启
+
+// ProxyIP 列表 - 从环境变量或使用默认列表
+// 这些 IP 是 Cloudflare 的优选 IP，用于绕过服务封禁
+const proxyIPs = globalThis.PROXYIP 
+    ? globalThis.PROXYIP.split(',').map(ip => ip.trim())
+    : [
+        // 以下为社区验证可用的 Cloudflare CDN IP
+        '162.159.192.0/24',  // 香港节点
+        '162.159.193.0/24',  // 香港节点
+        '162.159.195.0/24',  // 香港节点
+        '162.159.196.0/24',  // 香港节点
+        '162.159.200.0/24',  // 日本节点
+        '162.159.201.0/24',  // 日本节点（当前使用）
+        '162.159.204.0/24',  // 新加坡节点
+        '104.16.0.0/13',     // Cloudflare 官方 CDN
+        '104.24.0.0/14',     // Cloudflare 官方 CDN
+        '141.101.64.0/18',   // Cloudflare 官方 CDN
+    ];
+
+// 随机选择一个具体的 ProxyIP
+function getRandomProxyIP() {
+    const ipRange = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+    
+    // 如果是 CIDR 格式，随机生成一个具体 IP
+    if (ipRange.includes('/')) {
+        const [baseIP, prefix] = ipRange.split('/');
+        const prefixNum = parseInt(prefix);
+        const parts = baseIP.split('.').map(Number);
+        
+        // 根据前缀长度计算可变部分
+        const variableBits = 32 - prefixNum;
+        const maxHosts = Math.pow(2, variableBits) - 1;
+        const randomHost = Math.floor(Math.random() * maxHosts);
+        
+        // 转换为 IP 地址
+        const ipNum = (parts[0] << 24) + (parts[1] << 16) + (parts[2] << 8) + parts[3];
+        const resultIP = ipNum + randomHost;
+        
+        return [
+            (resultIP >> 24) & 255,
+            (resultIP >> 16) & 255,
+            (resultIP >> 8) & 255,
+            resultIP & 255
+        ].join('.');
+    }
+    
+    return ipRange;
+}
+
+// 当前使用的 ProxyIP（初始化时随机选择）
+let currentProxyIP = getRandomProxyIP();
+
+// 超时设置（毫秒）
 const CONNECT_TIMEOUT = 10000;
 const SOCKET_TIMEOUT = 30000;
+const MAX_RETRIES = 3;  // 最大重试次数
 
-// 备用代理IP列表（按速度排序）
-const backupProxyIPs = [
-    '162.159.201.1',  // 日本节点 - 51ms（最快）
-    '162.159.195.1',  // 香港节点 - 169ms
-    '162.159.204.1',  // 新加坡节点 - 152ms
-    '162.159.138.1',  // 通用节点 - 145ms
-    '162.159.137.1',  // 通用节点 - 155ms
-    '1.1.1.1',        // Cloudflare DNS
-    '8.8.8.8'         // Google DNS
-];
-
-// DNS服务器
+// DNS 服务器（用于 DoH）
 const dnsServers = [
     'https://1.1.1.1/dns-query',
     'https://8.8.8.8/dns-query',
     'https://9.9.9.9/dns-query'
 ];
 
-// WebSocket状态
+// WebSocket 状态
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 
-// 处理所有请求
+// ==================== 主请求处理 ====================
+
 export async function onRequest(context) {
-    const { request } = context;
+    const { request, env } = context;
     const url = new URL(request.url);
+    
+    // 从环境变量更新配置
+    if (env.UUID) globalThis.UUID = env.UUID;
+    if (env.PROXYIP) globalThis.PROXYIP = env.PROXYIP;
+    if (env.FORCE_PROXY_MODE !== undefined) globalThis.FORCE_PROXY_MODE = env.FORCE_PROXY_MODE;
     
     // 检查 WebSocket 升级
     const upgradeHeader = request.headers.get('Upgrade');
@@ -49,14 +105,16 @@ export async function onRequest(context) {
         return vlessOverWSHandler(request);
     }
     
-    // 健康检查端点
+    // 健康检查
     if (url.pathname === '/' || url.pathname === '/health') {
         return new Response(JSON.stringify({
             status: 'ok',
-            service: 'VLESS Proxy - Pages Functions',
-            version: '2.0',
+            service: 'VLESS Proxy - Twitter/X Enabled',
+            version: '3.0',
             uuid: UUID,
             domain: url.hostname,
+            proxy_mode: FORCE_PROXY_MODE ? 'force' : 'fallback',
+            current_proxy_ip: currentProxyIP,
             timestamp: new Date().toISOString(),
             cf: {
                 colo: request.cf?.colo,
@@ -66,15 +124,15 @@ export async function onRequest(context) {
             status: 200,
             headers: {
                 'Content-Type': 'application/json',
-                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Cache-Control': 'no-cache',
                 'Access-Control-Allow-Origin': '*'
             }
         });
     }
     
-    // 配置信息端点
+    // 配置信息
     if (url.pathname === '/config') {
-        const vlessLink = `vless://${UUID}@${url.hostname}:443?encryption=none&security=tls&sni=${url.hostname}&fp=randomized&type=ws&host=${url.hostname}&path=%2F%3Fed%3D2048#VLESS-Pages`;
+        const vlessLink = `vless://${UUID}@${url.hostname}:443?encryption=none&security=tls&sni=${url.hostname}&fp=randomized&type=ws&host=${url.hostname}&path=%2F%3Fed%3D2048#VLESS-Twitter`;
         
         return new Response(JSON.stringify({
             uuid: UUID,
@@ -85,38 +143,33 @@ export async function onRequest(context) {
             type: 'ws',
             host: url.hostname,
             path: '/?ed=2048',
+            proxy_mode: FORCE_PROXY_MODE ? 'force' : 'fallback',
+            current_proxy_ip: currentProxyIP,
             vless_link: vlessLink,
-            note: '使用此配置连接 VLESS 客户端'
-        }), {
-            status: 200,
-            headers: {
-                'Content-Type': 'application/json',
-                'Cache-Control': 'no-cache'
-            }
-        });
-    }
-    
-    // 状态检查
-    if (url.pathname === '/status') {
-        return new Response(JSON.stringify({
-            status: 'running',
-            uuid: UUID,
-            proxy_ip: proxyIP,
-            backup_ips: backupProxyIPs.length,
-            timestamp: new Date().toISOString()
+            note: '支持 Twitter/X 访问'
         }), {
             status: 200,
             headers: { 'Content-Type': 'application/json' }
         });
     }
     
-    // 其他路径返回 404
+    // 切换 ProxyIP（用于调试）
+    if (url.pathname === '/switch-proxy') {
+        currentProxyIP = getRandomProxyIP();
+        return new Response(JSON.stringify({
+            new_proxy_ip: currentProxyIP,
+            message: 'ProxyIP 已切换'
+        }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+        });
+    }
+    
     return new Response('Not Found', { status: 404 });
 }
 
-/**
- * 处理 WebSocket VLESS 连接
- */
+// ==================== VLESS WebSocket 处理 ====================
+
 async function vlessOverWSHandler(request) {
     // @ts-ignore
     const webSocketPair = new WebSocketPair();
@@ -133,18 +186,17 @@ async function vlessOverWSHandler(request) {
     const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
     const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
     
-    let remoteSocketWapper = { value: null };
+    let remoteSocketWrapper = { value: null };
     let udpStreamWrite = null;
     let isDns = false;
     
-    // ws --> remote
     readableWebSocketStream.pipeTo(new WritableStream({
         async write(chunk, controller) {
             if (isDns && udpStreamWrite) {
                 return udpStreamWrite(chunk);
             }
-            if (remoteSocketWapper.value) {
-                const writer = remoteSocketWapper.value.writable.getWriter();
+            if (remoteSocketWrapper.value) {
+                const writer = remoteSocketWrapper.value.writable.getWriter();
                 await writer.write(chunk);
                 writer.releaseLock();
                 return;
@@ -190,7 +242,7 @@ async function vlessOverWSHandler(request) {
             }
             
             await handleTCPOutBound(
-                remoteSocketWapper,
+                remoteSocketWrapper,
                 addressRemote,
                 portRemote,
                 rawClientData,
@@ -217,15 +269,18 @@ async function vlessOverWSHandler(request) {
     });
 }
 
-/**
- * 处理 TCP 出站连接
- */
+// ==================== TCP 出站处理（核心改进） ====================
+
 async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log) {
-    async function connectWithTimeout(address, port) {
+    let retryCount = 0;
+    let lastError = null;
+    
+    // 带超时的连接函数
+    async function connectWithTimeout(address, port, timeout = CONNECT_TIMEOUT) {
         return new Promise((resolve, reject) => {
             const timeoutId = setTimeout(() => {
                 reject(new Error(`Connection timeout to ${address}:${port}`));
-            }, CONNECT_TIMEOUT);
+            }, timeout);
             
             try {
                 const tcpSocket = connect({
@@ -254,6 +309,7 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
         });
     }
     
+    // 连接并写入数据
     async function connectAndWrite(address, port) {
         const tcpSocket = await connectWithTimeout(address, port);
         remoteSocket.value = tcpSocket;
@@ -266,25 +322,55 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
         return tcpSocket;
     }
     
+    // 重试函数（切换 ProxyIP）
+    async function retry() {
+        retryCount++;
+        currentProxyIP = getRandomProxyIP();
+        log(`Retry #${retryCount} with new ProxyIP: ${currentProxyIP}`);
+        
+        try {
+            const tcpSocket = await connectAndWrite(currentProxyIP, portRemote);
+            remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retryCount < MAX_RETRIES ? retry : null, log);
+        } catch (error) {
+            lastError = error;
+            log(`Retry #${retryCount} failed: ${error.message}`);
+            
+            if (retryCount < MAX_RETRIES) {
+                await retry();
+            } else {
+                log('All retries exhausted');
+                safeCloseWebSocket(webSocket);
+            }
+        }
+    }
+    
+    // 主连接逻辑
     try {
-        const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-        remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
+        if (FORCE_PROXY_MODE) {
+            // 主动 ProxyIP 模式：所有流量都通过 ProxyIP
+            log(`FORCE_PROXY_MODE enabled - using ProxyIP: ${currentProxyIP}`);
+            const tcpSocket = await connectAndWrite(currentProxyIP, portRemote);
+            remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
+        } else {
+            // 传统模式：先直连，失败后使用 ProxyIP
+            try {
+                log(`Direct connection to ${addressRemote}:${portRemote}`);
+                const tcpSocket = await connectAndWrite(addressRemote, portRemote);
+                remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
+            } catch (directError) {
+                log(`Direct connection failed: ${directError.message}, trying ProxyIP`);
+                const tcpSocket = await connectAndWrite(currentProxyIP, portRemote);
+                remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
+            }
+        }
     } catch (error) {
         log(`Connection failed: ${error.message}`);
-        // 尝试使用代理IP
-        try {
-            const tcpSocket = await connectAndWrite(proxyIP, portRemote);
-            remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
-        } catch (proxyError) {
-            log(`Proxy connection also failed: ${proxyError.message}`);
-            safeCloseWebSocket(webSocket);
-        }
+        safeCloseWebSocket(webSocket);
     }
 }
 
-/**
- * 创建 WebSocket 可读流
- */
+// ==================== WebSocket 流处理 ====================
+
 function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
     let readableStreamCancel = false;
     const stream = new ReadableStream({
@@ -323,9 +409,8 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
     return stream;
 }
 
-/**
- * 处理 VLESS 协议头
- */
+// ==================== VLESS 协议处理 ====================
+
 function processVlessHeader(vlessBuffer, userID) {
     if (vlessBuffer.byteLength < 24) {
         return { hasError: true, message: 'invalid data' };
@@ -404,9 +489,8 @@ function processVlessHeader(vlessBuffer, userID) {
     };
 }
 
-/**
- * 远程 Socket 转发到 WebSocket
- */
+// ==================== Socket 转发 ====================
+
 async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, retry, log) {
     let vlessHeader = vlessResponseHeader;
     let hasIncomingData = false;
@@ -444,9 +528,8 @@ async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, re
     }
 }
 
-/**
- * 处理 UDP 出站（DNS）
- */
+// ==================== UDP/DNS 处理 ====================
+
 async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
     let isVlessHeaderSent = false;
     const transformStream = new TransformStream({
@@ -454,9 +537,9 @@ async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
         transform(chunk, controller) {
             for (let index = 0; index < chunk.byteLength;) {
                 const lengthBuffer = chunk.slice(index, index + 2);
-                const udpPakcetLength = new DataView(lengthBuffer).getUint16(0);
-                const udpData = new Uint8Array(chunk.slice(index + 2, index + 2 + udpPakcetLength));
-                index = index + 2 + udpPakcetLength;
+                const udpPacketLength = new DataView(lengthBuffer).getUint16(0);
+                const udpData = new Uint8Array(chunk.slice(index + 2, index + 2 + udpPacketLength));
+                index = index + 2 + udpPacketLength;
                 controller.enqueue(udpData);
             }
         },
@@ -505,9 +588,8 @@ async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
     };
 }
 
-/**
- * Base64 解码
- */
+// ==================== 工具函数 ====================
+
 function base64ToArrayBuffer(base64Str) {
     if (!base64Str) return { error: null };
     try {
@@ -520,9 +602,6 @@ function base64ToArrayBuffer(base64Str) {
     }
 }
 
-/**
- * 安全关闭 WebSocket
- */
 function safeCloseWebSocket(socket) {
     try {
         if (socket.readyState === WS_READY_STATE_OPEN || socket.readyState === WS_READY_STATE_CLOSING) {
@@ -533,9 +612,6 @@ function safeCloseWebSocket(socket) {
     }
 }
 
-/**
- * UUID 验证
- */
 function isValidUUID(uuid) {
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     return uuidRegex.test(uuid);
