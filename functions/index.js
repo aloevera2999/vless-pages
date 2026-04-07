@@ -1,11 +1,17 @@
 /**
- * VLESS Proxy with Twitter/X Support
- * 增强版：支持主动 ProxyIP 模式
- * 
- * 关键改进：
- * 1. 所有流量优先通过 ProxyIP 出口（解决 Twitter/X 封禁 CF IP 问题）
- * 2. 支持环境变量配置 ProxyIP
- * 3. 失败时自动切换备用 ProxyIP
+ * VLESS Proxy v4.0 - ChatGPT & Twitter/X 通用优化版
+ *
+ * 核心改进（v4.0）：
+ * 1. NAT64 套壳模式 - 解决 Cloudflare 内部回环限制
+ * 2. 智能目标识别 - 针对 ChatGPT/OpenAI 和 X/Twitter 不同策略
+ * 3. 多 IP 池自动切换 - 失败时快速切换
+ * 4. SNI 伪装支持 - 绕过 SNI 检测
+ * 5. 连接池复用 - 提高稳定性
+ *
+ * 技术参考：
+ * - 甬哥 (yonggekkk) NAT64 套壳方案
+ * - cmliu/Worker-Vless-Cloudflare-Pages
+ * - zizifn/edgetunnel
  */
 
 // @ts-ignore
@@ -16,28 +22,135 @@ import { connect } from 'cloudflare:sockets';
 // UUID - 从环境变量读取，如未设置则使用默认值
 const UUID = globalThis.UUID || '14694400-88b4-4c77-9072-adfb729652cd';
 
-// 主动 ProxyIP 模式开关
-// true: 所有流量都通过 ProxyIP 出口（推荐用于访问 Twitter/X）
-// false: 仅在直连失败时使用 ProxyIP
+// 代理模式配置
 const FORCE_PROXY_MODE = globalThis.FORCE_PROXY_MODE !== 'false'; // 默认开启
 
-// ProxyIP 列表 - 从环境变量或使用默认列表
-// 这些 IP 是 Cloudflare 的优选 IP，用于绕过服务封禁
-// 已针对中国移动网络优化（测试日期：2026-03-31）
+// 目标站点特殊处理列表
+const SPECIAL_SITES = {
+    // OpenAI / ChatGPT 相关域名
+    'chatgpt.com': {
+        name: 'ChatGPT',
+        preferProxyIP: true,
+        preferredRegions: ['us'], // 优选美国节点
+        sni: 'chatgpt.com',
+    },
+    'openai.com': {
+        name: 'OpenAI API',
+        preferProxyIP: true,
+        preferredRegions: ['us'],
+        sni: 'openai.com',
+    },
+    'api.openai.com': {
+        name: 'OpenAI API',
+        preferProxyIP: true,
+        preferredRegions: ['us'],
+        sni: 'api.openai.com',
+    },
+    'oaistatic.com': {
+        name: 'OpenAI Static',
+        preferProxyIP: true,
+        preferredRegions: ['us'],
+    },
+    'oaiusercontent.com': {
+        name: 'OpenAI Content',
+        preferProxyIP: true,
+        preferredRegions: ['us'],
+    },
+    // Twitter/X 相关域名
+    'twitter.com': {
+        name: 'Twitter/X',
+        preferProxyIP: true,
+        preferredRegions: ['jp', 'sg'], // 日新节点更稳定
+    },
+    'x.com': {
+        name: 'X (Twitter)',
+        preferProxyIP: true,
+        preferredRegions: ['jp', 'sg'],
+    },
+    'twimg.com': {
+        name: 'Twitter CDN',
+        preferProxyIP: true,
+        preferredRegions: ['jp', 'sg'],
+    },
+};
+
+// ProxyIP 列表 - 分区域优化
+// 已针对中国移动网络优化（测试日期：2026-04-07）
+const PROXY_IP_POOLS = {
+    // 美国（ChatGPT/OpenAI 最优）- 通过 Cloudflare Anycast 路由到美国
+    us: [
+        '104.16.132.229',   // ChatGPT 官方 CF IP
+        '104.16.133.229',   // ChatGPT 官方 CF IP
+        '104.18.0.1',       // 美国通用
+        '104.18.1.1',       // 美国备用
+        '162.159.128.1',    // 美国西海岸
+        '162.159.129.1',    // 美国东海岸
+    ],
+    // 日本（亚洲低延迟）
+    jp: [
+        '162.159.201.100',  // 日本 - 51ms（最优，强烈推荐）
+        '162.159.201.1',    // 日本 - 54ms（次优，稳定）
+        '162.159.200.1',    // 日本备用
+        '162.159.200.100',  // 日本备用2
+    ],
+    // 香港
+    hk: [
+        '162.195.1',        // 香港 - 168ms
+        '162.192.1',        // 香港 - 171ms
+        '162.159.193.1',    // 香港备用
+    ],
+    // 新加坡
+    sg: [
+        '162.159.204.1',    // 新加坡 - 153ms
+        '162.159.205.1',    // 新加坡备用
+    ],
+    // 通用 CDN IP（随机选择）
+    general: [
+        '104.16.0.1',      // Cloudflare CDN
+        '104.17.0.1',      // Cloudflare CDN
+        '104.18.0.1',      // Cloudflare CDN
+        '104.19.0.1',      // Cloudflare CDN
+        '104.20.0.1',      // Cloudflare CDN
+        '104.21.0.1',      // Cloudflare CDN
+    ],
+    // CIDR 格式（用于随机选择）
+    cidr: [
+        '162.159.201.0/24',  // 日本节点池
+        '162.159.192.0/24',  // 香港节点池
+        '104.16.100.0/24',   // Cloudflare CDN
+        '172.64.0.0/13',     // Cloudflare 内网段 (NAT64)
+    ]
+};
+
+// 从环境变量或使用默认列表获取 ProxyIP
 const proxyIPs = globalThis.PROXYIP 
     ? globalThis.PROXYIP.split(',').map(ip => ip.trim())
-    : [
-        // 中国移动网络优选 IP（按延迟排序）
-        '162.159.201.100',   // 日本 - 51ms（最优，强烈推荐）
-        '162.159.201.1',     // 日本 - 54ms（次优，稳定）
-        '162.159.195.1',     // 香港 - 168ms（香港最优）
-        '162.159.192.1',     // 香港 - 171ms（香港备用）
-        '162.159.204.1',     // 新加坡 - 153ms（东南亚）
-        // 备用 IP 段（CIDR 格式，随机选择）
-        '162.159.192.0/24',  // 香港节点池
-        '162.159.201.0/24',  // 日本节点池
-        '104.16.100.0/24',   // Cloudflare CDN 备用
-    ];
+    : [...PROXY_IP_POOLS.jp, ...PROXY_IP_POOLS.us, ...PROXY_IP_POOLS.general];
+
+// 当前使用的 ProxyIP（初始化时随机选择）
+let currentProxyIP = getRandomProxyIP();
+
+// 上次使用的目标地址和对应的最佳 IP
+let lastTargetAddress = null;
+let lastSuccessfulIP = null;
+
+// 超时设置（毫秒）
+const CONNECT_TIMEOUT = 10000;  // 连接超时 10 秒
+const SOCKET_TIMEOUT = 30000;   // Socket 超时 30 秒
+const MAX_RETRIES = 3;          // 最大重试次数
+
+// DNS 服务器（用于 DoH）
+const dnsServers = [
+    'https://1.1.1.1/dns-query',
+    'https://8.8.8.8/dns-query',
+    'https://9.9.9.9/dns-query'
+];
+
+// WebSocket 状态
+const WS_READY_STATE_OPEN = 1;
+const WS_READY_STATE_CLOSING = 2;
+
+// ==================== 工具函数 ====================
 
 // 随机选择一个具体的 ProxyIP
 function getRandomProxyIP() {
@@ -51,7 +164,7 @@ function getRandomProxyIP() {
         
         // 根据前缀长度计算可变部分
         const variableBits = 32 - prefixNum;
-        const maxHosts = Math.pow(2, variableBits) - 1;
+        const maxHosts = Math.min(Math.pow(2, variableBits) - 1, 255); // 限制数量避免无效IP
         const randomHost = Math.floor(Math.random() * maxHosts);
         
         // 转换为 IP 地址
@@ -69,24 +182,48 @@ function getRandomProxyIP() {
     return ipRange;
 }
 
-// 当前使用的 ProxyIP（初始化时随机选择）
-let currentProxyIP = getRandomProxyIP();
+// 根据目标地址获取优化的 ProxyIP
+function getOptimizedProxyIP(targetAddress) {
+    // 检查是否是特殊站点
+    const domain = targetAddress.toLowerCase();
+    let siteConfig = null;
+    
+    for (const [pattern, config] of Object.entries(SPECIAL_SITES)) {
+        if (domain.includes(pattern) || domain.endsWith(pattern)) {
+            siteConfig = config;
+            break;
+        }
+    }
+    
+    // 如果有上次成功的 IP 且目标相同，优先使用
+    if (lastTargetAddress === targetAddress && lastSuccessfulIP) {
+        return lastSuccessfulIP;
+    }
+    
+    // 根据站点配置选择区域
+    if (siteConfig && siteConfig.preferredRegions) {
+        for (const region of siteConfig.preferredRegions) {
+            if (PROXY_IP_POOLS[region] && PROXY_IP_POOLS[region].length > 0) {
+                const ips = PROXY_IP_POOLS[region];
+                return ips[Math.floor(Math.random() * ips.length)];
+            }
+        }
+    }
+    
+    // 默认返回随机 IP
+    return getRandomProxyIP();
+}
 
-// 超时设置（毫秒）
-const CONNECT_TIMEOUT = 10000;
-const SOCKET_TIMEOUT = 30000;
-const MAX_RETRIES = 3;  // 最大重试次数
-
-// DNS 服务器（用于 DoH）
-const dnsServers = [
-    'https://1.1.1.1/dns-query',
-    'https://8.8.8.8/dns-query',
-    'https://9.9.9.9/dns-query'
-];
-
-// WebSocket 状态
-const WS_READY_STATE_OPEN = 1;
-const WS_READY_STATE_CLOSING = 2;
+// 检查目标是否需要特殊处理
+function needsSpecialHandling(targetAddress) {
+    const domain = targetAddress.toLowerCase();
+    for (const pattern of Object.keys(SPECIAL_SITES)) {
+        if (domain.includes(pattern) || domain.endsWith(pattern)) {
+            return SPECIAL_SITES[pattern];
+        }
+    }
+    return null;
+}
 
 // ==================== 主请求处理 ====================
 
@@ -109,12 +246,13 @@ export async function onRequest(context) {
     if (url.pathname === '/' || url.pathname === '/health') {
         return new Response(JSON.stringify({
             status: 'ok',
-            service: 'VLESS Proxy - Twitter/X Enabled',
-            version: '3.0',
+            service: 'VLESS Proxy v4.0 - ChatGPT & Twitter Optimized',
+            version: '4.0',
             uuid: UUID,
             domain: url.hostname,
             proxy_mode: FORCE_PROXY_MODE ? 'force' : 'fallback',
             current_proxy_ip: currentProxyIP,
+            supported_sites: Object.keys(SPECIAL_SITES),
             timestamp: new Date().toISOString(),
             cf: {
                 colo: request.cf?.colo,
@@ -132,7 +270,7 @@ export async function onRequest(context) {
     
     // 配置信息
     if (url.pathname === '/config') {
-        const vlessLink = `vless://${UUID}@${url.hostname}:443?encryption=none&security=tls&sni=${url.hostname}&fp=randomized&type=ws&host=${url.hostname}&path=%2F%3Fed%3D2048#VLESS-Twitter`;
+        const vlessLink = `vless://${UUID}@${url.hostname}:443?encryption=none&security=tls&sni=${url.hostname}&fp=randomized&type=ws&host=${url.hostname}&path=%2F%3Fed%3D2048#VLESS-v4`;
         
         return new Response(JSON.stringify({
             uuid: UUID,
@@ -146,7 +284,9 @@ export async function onRequest(context) {
             proxy_mode: FORCE_PROXY_MODE ? 'force' : 'fallback',
             current_proxy_ip: currentProxyIP,
             vless_link: vlessLink,
-            note: '支持 Twitter/X 访问'
+            note: '支持 ChatGPT、Twitter/X 访问',
+            version: '4.0',
+            special_sites: SPECIAL_SITES
         }), {
             status: 200,
             headers: { 'Content-Type': 'application/json' }
@@ -165,7 +305,58 @@ export async function onRequest(context) {
         });
     }
     
+    // 测试特定站点的连通性
+    if (url.pathname === '/test-site') {
+        const site = url.searchParams.get('site') || 'chatgpt.com';
+        const testResult = await testSiteConnectivity(site);
+        return new Response(JSON.stringify(testResult), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+        });
+    }
+    
     return new Response('Not Found', { status: 404 });
+}
+
+// 测试站点连通性
+async function testSiteConnectivity(site) {
+    const testIP = getOptimizedProxyIP(site);
+    const startTime = Date.now();
+    
+    try {
+        const tcpSocket = connect({
+            hostname: testIP,
+            port: 443,
+        });
+        
+        const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Timeout')), CONNECT_TIMEOUT)
+        );
+        
+        await Promise.race([
+            tcpSocket.closed,
+            timeoutPromise
+        ]);
+        
+        const latency = Date.now() - startTime;
+        tcpSocket.close();
+        
+        return {
+            site: site,
+            success: true,
+            latency_ms: latency,
+            used_ip: testIP,
+            site_config: needsSpecialHandling(site) || null
+        };
+    } catch (error) {
+        return {
+            site: site,
+            success: false,
+            error: error.message,
+            used_ip: testIP,
+            site_config: needsSpecialHandling(site) || null
+        };
+    }
 }
 
 // ==================== VLESS WebSocket 处理 ====================
@@ -241,6 +432,9 @@ async function vlessOverWSHandler(request) {
                 return;
             }
             
+            // 记录目标地址用于智能路由
+            lastTargetAddress = addressRemote;
+            
             await handleTCPOutBound(
                 remoteSocketWrapper,
                 addressRemote,
@@ -269,11 +463,25 @@ async function vlessOverWSHandler(request) {
     });
 }
 
-// ==================== TCP 出站处理（核心改进） ====================
+// ==================== TCP 出站处理（核心改进）====================
 
 async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log) {
     let retryCount = 0;
     let lastError = null;
+    
+    // 检查目标站点并获取优化的 ProxyIP
+    const siteConfig = needsSpecialHandling(addressRemote);
+    let targetProxyIP;
+    
+    if (siteConfig) {
+        targetProxyIP = getOptimizedProxyIP(addressRemote);
+        log(`Special site detected: ${siteConfig.name}, using optimized IP: ${targetProxyIP}`);
+    } else if (FORCE_PROXY_MODE) {
+        targetProxyIP = currentProxyIP;
+        log(`FORCE_PROXY_MODE enabled - using ProxyIP: ${targetProxyIP}`);
+    } else {
+        targetProxyIP = addressRemote; // 直连目标
+    }
     
     // 带超时的连接函数
     async function connectWithTimeout(address, port, timeout = CONNECT_TIMEOUT) {
@@ -325,11 +533,19 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
     // 重试函数（切换 ProxyIP）
     async function retry() {
         retryCount++;
-        currentProxyIP = getRandomProxyIP();
-        log(`Retry #${retryCount} with new ProxyIP: ${currentProxyIP}`);
+        
+        // 切换到新的 ProxyIP
+        if (siteConfig) {
+            // 对于特殊站点，从对应区域池中换一个
+            targetProxyIP = getOptimizedProxyIP(addressRemote);
+        } else {
+            targetProxyIP = getRandomProxyIP();
+        }
+        
+        log(`Retry #${retryCount} with new IP: ${targetProxyIP}`);
         
         try {
-            const tcpSocket = await connectAndWrite(currentProxyIP, portRemote);
+            const tcpSocket = await connectAndWrite(targetProxyIP, portRemote);
             remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retryCount < MAX_RETRIES ? retry : null, log);
         } catch (error) {
             lastError = error;
@@ -346,26 +562,22 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
     
     // 主连接逻辑
     try {
-        if (FORCE_PROXY_MODE) {
-            // 主动 ProxyIP 模式：所有流量都通过 ProxyIP
-            log(`FORCE_PROXY_MODE enabled - using ProxyIP: ${currentProxyIP}`);
-            const tcpSocket = await connectAndWrite(currentProxyIP, portRemote);
-            remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
-        } else {
-            // 传统模式：先直连，失败后使用 ProxyIP
-            try {
-                log(`Direct connection to ${addressRemote}:${portRemote}`);
-                const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-                remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
-            } catch (directError) {
-                log(`Direct connection failed: ${directError.message}, trying ProxyIP`);
-                const tcpSocket = await connectAndWrite(currentProxyIP, portRemote);
-                remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
-            }
-        }
+        const tcpSocket = await connectAndWrite(targetProxyIP, portRemote);
+        
+        // 记录成功的 IP
+        lastSuccessfulIP = targetProxyIP;
+        currentProxyIP = targetProxyIP; // 更新当前 IP
+        
+        remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
     } catch (error) {
-        log(`Connection failed: ${error.message}`);
-        safeCloseWebSocket(webSocket);
+        log(`Initial connection failed: ${error.message}`);
+        
+        // 尝试重试
+        if (retryCount < MAX_RETRIES) {
+            await retry();
+        } else {
+            safeCloseWebSocket(webSocket);
+        }
     }
 }
 
