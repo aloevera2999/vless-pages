@@ -484,17 +484,25 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
     }
     
     // 带超时的连接函数
-    async function connectWithTimeout(address, port, timeout = CONNECT_TIMEOUT) {
+    async function connectWithTimeout(address, port, timeout = CONNECT_TIMEOUT, sni = null) {
         return new Promise((resolve, reject) => {
             const timeoutId = setTimeout(() => {
                 reject(new Error(`Connection timeout to ${address}:${port}`));
             }, timeout);
             
             try {
-                const tcpSocket = connect({
+                // 关键修复: 传入 serverName (SNI)，让 CF ProxyIP 能路由到正确的目标
+                const connectOptions = {
                     hostname: address,
                     port: port,
-                });
+                };
+                
+                // 如果连接的是 ProxyIP (CF CDN IP)，需要设置 SNI 指向真实目标
+                if (sni && address !== sni) {
+                    connectOptions.serverName = sni;
+                }
+                
+                const tcpSocket = connect(connectOptions);
                 
                 const socketTimeoutId = setTimeout(() => {
                     if (tcpSocket && !tcpSocket.closed) {
@@ -518,10 +526,10 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
     }
     
     // 连接并写入数据
-    async function connectAndWrite(address, port) {
-        const tcpSocket = await connectWithTimeout(address, port);
+    async function connectAndWrite(address, port, sni = null) {
+        const tcpSocket = await connectWithTimeout(address, port, CONNECT_TIMEOUT, sni);
         remoteSocket.value = tcpSocket;
-        log(`Connected to ${address}:${port}`);
+        log(`Connected to ${address}:${port}${sni ? ' (SNI: ' + sni + ')' : ''}`);
         
         const writer = tcpSocket.writable.getWriter();
         await writer.write(rawClientData);
@@ -545,7 +553,7 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
         log(`Retry #${retryCount} with new IP: ${targetProxyIP}`);
         
         try {
-            const tcpSocket = await connectAndWrite(targetProxyIP, portRemote);
+            const tcpSocket = await connectAndWrite(targetProxyIP, portRemote, addressRemote);
             remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retryCount < MAX_RETRIES ? retry : null, log);
         } catch (error) {
             lastError = error;
@@ -562,7 +570,8 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
     
     // 主连接逻辑
     try {
-        const tcpSocket = await connectAndWrite(targetProxyIP, portRemote);
+        // 关键修复: 传递真实目标域名作为 SNI
+        const tcpSocket = await connectAndWrite(targetProxyIP, portRemote, addressRemote);
         
         // 记录成功的 IP
         lastSuccessfulIP = targetProxyIP;
