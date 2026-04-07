@@ -2,7 +2,7 @@
   "name": "vless-pages-functions",
   "version": "1.0.0",
   "description": "VLESS Proxy on Cloudflare Pages Functions",
-  "main": "functions/api/[[path]].js",
+  "main": "functions/index.js",
   "scripts": {
     "dev": "wrangler pages dev --compatibility-date=2024-01-01 -- npm run start",
     "start": "echo 'Pages Functions running'",
