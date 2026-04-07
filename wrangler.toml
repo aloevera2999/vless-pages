@@ -1,10 +1,7 @@
 name = "vless-lee-proxy"
 compatibility_date = "2024-01-01"
+pages_build_output_dir = "public"
 
-# Pages Functions 模式，不需要构建输出目录
-# pages_build_output_dir = "public"
-
-# 开发环境配置
-[dev]
-port = 8788
-local_protocol = "http"
+[vars]
+UUID = "14694400-88b4-4c77-9072-adfb729652cd"
+FORCE_PROXY_MODE = "true"
