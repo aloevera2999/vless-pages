@@ -53,13 +53,44 @@ export async function onRequest(context) {
         return vlessOverWSHandler(request);
     }
 
-    // 健康检查
+    // 通过 ?action= 参数触发特殊端点（避免 public/index.html 静态文件拦截非根路径）
+    const action = url.searchParams.get('action');
+
+    // fetch API 测试 - 验证 Pages Functions 的 fetch() 能力（connect 的替代方案）
+    if (action === 'fetch-test') {
+        const results = {};
+        const targets = [
+            ['google_204',   'http://www.google.com/generate_204', false],
+            ['chatgpt',      'http://chatgpt.com/',                false],
+            ['cloudflare',   'https://cloudflare.com/',             true],
+            ['twitter_x',    'https://x.com/',                      true],
+            ['example',      'https://example.com/',                true],
+        ];
+        for (const [name, urlStr, noRedirect] of targets) {
+            try {
+                const t0 = Date.now();
+                const r = await fetch(urlStr, {
+                    method: 'HEAD',
+                    redirect: noRedirect ? 'manual' : 'follow',
+                    headers: { 'User-Agent': 'Mozilla/5.0' }
+                });
+                results[name] = { ok: true, status: r.status, ms: Date.now() - t0 };
+            } catch(e) {
+                results[name] = { ok: false, error: e.message };
+            }
+        }
+        return new Response(JSON.stringify({ version: '4.4', env: 'pages-functions', tests: results }, null, 2), {
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        });
+    }
+
+    // 健康检查（默认 / 路径）
     if (url.pathname === '/' || url.pathname === '/health') {
         return new Response(JSON.stringify({
             status: 'ok',
             service: 'VLESS Proxy v4.4',
             version: '4.4',
-            fix: 'fetch-test endpoint + connect() diagnostic',
+            fix: 'fetch-test endpoint via ?action= param',
             uuid: UUID,
             domain: url.hostname,
             proxy_mode: FORCE_PROXY_MODE ? 'force' : 'fallback',
@@ -71,41 +102,6 @@ export async function onRequest(context) {
             headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*' }
         });
     }
-
-    // fetch API 测试（用于验证 fetch 是否可用作 connect 替代）
-    if (url.pathname === '/fetch-test') {
-        const results = {};
-        const targets = [
-            ['google_http',  'http://www.google.com/generate_204'],
-            ['chatgpt_http', 'http://chatgpt.com/'],
-            ['cloudflare',   'https://cloudflare.com/', true],
-            ['twitter',      'https://x.com/',          true],
-        ];
-        for (const [name, urlStr, noRedirect] of targets) {
-            try {
-                const t0 = Date.now();
-                const r = await fetch(urlStr, {
-                    method: 'HEAD',
-                    redirect: noRedirect ? 'manual' : 'follow',
-                    headers: { 'User-Agent': 'curl/8.0' }
-                });
-                results[name] = { ok: true, status: r.status, ms: Date.now() - t0 };
-            } catch(e) {
-                results[name] = { ok: false, error: e.message };
-            }
-        }
-        return new Response(JSON.stringify({ version: '4.4', tests: results }, null, 2), {
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    }
-
-    // 网络诊断端点
-    if (url.pathname === '/diag') {
-        return await runDiagnostics(request);
-    }
-
-    return new Response('Not Found', { status: 404 });
-}
 
 // ==================== 网络诊断 ====================
 
