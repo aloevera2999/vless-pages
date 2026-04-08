@@ -1,18 +1,16 @@
 /**
- * VLESS v4.2 - 修复版
+ * VLESS v4.3 - 诊断版
  * 
- * 核心问题诊断：
- * WS 升级 101 成功，但 Worker 内部 connect(ProxyIP) 后无数据返回
+ * v4.2 问题诊断：
+ * - WS 101 成功，但 connect(ProxyIP:443) 失败
+ * - 收到无 reason 的 CLOSE frame（说明 webSocket.close(1011, errMsg) 也失败了）
+ * - 怀疑：CF Workers 不允许连接到 CF 自身 IP 范围
  * 
- * 可能原因：
- * 1. connect() 没有等待 socket.opened 就开始写/读
- * 2. ProxyIP 连接后 TLS 握手需要 secureTransport: "on"
- * 3. socket closed 事件被错误触发
- * 
- * 修复方案：
- * - 添加 await tcpSocket.opened 等待连接建立
- * - 添加详细错误日志
- * - 添加连接状态跟踪
+ * v4.3 改进：
+ * 1. 尝试直连目标域名（不走 ProxyIP）作为 fallback
+ * 2. 更详细的错误信息（确保能传回客户端）
+ * 3. 连接前先记录所有参数
+ * 4. 添加 /diag 端点用于调试网络能力
  */
 
 // @ts-ignore
@@ -23,19 +21,17 @@ import { connect } from 'cloudflare:sockets';
 const UUID = globalThis.UUID || '14694400-88b4-4c77-9072-adfb729652cd';
 const FORCE_PROXY_MODE = globalThis.FORCE_PROXY_MODE !== 'false';
 
-// ProxyIP 列表 - 使用经过验证的 IP
+// ProxyIP 列表 - 使用非 CF IP 或已验证的 IP
 const PROXY_IP_LIST = [
-    '104.16.132.229',   // ChatGPT CF IP (已验证)
-    '104.16.133.229',   // ChatGPT CF IP 备用
-    '162.159.201.100',  // 日本节点
-    '162.159.200.100',  // 日本备用
+    '104.16.132.229',   // ChatGPT CF IP
+    '162.159.201.100',  // 日本节点  
 ];
 
-let currentProxyIP = PROXY_IP_LIST[0]; // 默认使用第一个
+let currentProxyIP = PROXY_IP_LIST[0];
 
 // 超时设置
-const CONNECT_TIMEOUT = 8000;
-const DATA_TIMEOUT = 15000;
+const CONNECT_TIMEOUT = 10000;
+const DATA_TIMEOUT = 20000;
 
 // WebSocket 状态
 const WS_READY_STATE_OPEN = 1;
@@ -61,9 +57,9 @@ export async function onRequest(context) {
     if (url.pathname === '/' || url.pathname === '/health') {
         return new Response(JSON.stringify({
             status: 'ok',
-            service: 'VLESS Proxy v4.2',
-            version: '4.2',
-            fix: 'await socket.opened + detailed error logging',
+            service: 'VLESS Proxy v4.3',
+            version: '4.3',
+            fix: 'direct-connect fallback + better error reporting',
             uuid: UUID,
             domain: url.hostname,
             proxy_mode: FORCE_PROXY_MODE ? 'force' : 'fallback',
@@ -76,12 +72,96 @@ export async function onRequest(context) {
         });
     }
 
-    // 配置信息
-    if (url.pathname === '/config') {
-        return new Response(JSON.stringify({ version: '4.2' }), { status: 200 });
+    // 网络诊断端点
+    if (url.pathname === '/diag') {
+        return await runDiagnostics(request);
     }
 
     return new Response('Not Found', { status: 404 });
+}
+
+// ==================== 网络诊断 ====================
+
+async function runDiagnostics(request) {
+    const results = {};
+    
+    // Test 1: 直连 chatgpt.com:443 (不经过 ProxyIP)
+    try {
+        const t1 = Date.now();
+        const s1 = connect({ hostname: 'chatgpt.com', port: 443 });
+        await Promise.race([s1.opened, timeout(CONNECT_TIMEOUT)]);
+        results['direct_chatgpt_com'] = { ok: true, ms: Date.now() - t1 };
+        s1.close();
+    } catch(e) {
+        results['direct_chatgpt_com'] = { ok: false, error: e.message };
+    }
+
+    // Test 2: 直连 www.google.com:443
+    try {
+        const t2 = Date.now();
+        const s2 = connect({ hostname: 'www.google.com', port: 443 });
+        await Promise.race([s2.opened, timeout(CONNECT_TIMEOUT)]);
+        results['direct_google_com'] = { ok: true, ms: Date.now() - t2 };
+        s2.close();
+    } catch(e) {
+        results['direct_google_com'] = { ok: false, error: e.message };
+    }
+
+    // Test 3: 通过 ProxyIP 连接 104.16.132.229:443
+    try {
+        const t3 = Date.now();
+        const s3 = connect({ hostname: '104.16.132.229', port: 443 });
+        await Promise.race([s3.opened, timeout(CONNECT_TIMEOUT)]);
+        results['proxyip_104_16_132_229'] = { ok: true, ms: Date.now() - t3 };
+        s3.close();
+    } catch(e) {
+        results['proxyip_104_16_132_229'] = { ok: false, error: e.message };
+    }
+
+    // Test 4: 通过 ProxyIP 连接 162.159.201.100:443
+    try {
+        const t4 = Date.now();
+        const s4 = connect({ hostname: '162.159.201.100', port: 443 });
+        await Promise.race([s4.opened, timeout(CONNECT_TIMEOUT)]);
+        results['proxyip_162_159_201_100'] = { ok: true, ms: Date.now() - t4 };
+        s4.close();
+    } catch(e) {
+        results['proxyip_162_159_201_100'] = { ok: false, error: e.message };
+    }
+
+    // Test 5: 连接 1.1.1.1:443 (Cloudflare DNS)
+    try {
+        const t5 = Date.now();
+        const s5 = connect({ hostname: '1.1.1.1', port: 443 });
+        await Promise.race([s5.opened, timeout(CONNECT_TIMEOUT)]);
+        results['direct_1_1_1_1'] = { ok: true, ms: Date.now() - t5 };
+        s5.close();
+    } catch(e) {
+        results['direct_1_1_1_1'] = { ok: false, error: e.message };
+    }
+
+    // Test 6: fetch API 测试
+    try {
+        const t6 = Date.now();
+        const r = await fetch('https://chatgpt.com', { method: 'HEAD', redirect: 'manual' });
+        results['fetch_chatgpt'] = { ok: true, status: r.status, ms: Date.now() - t6 };
+    } catch(e) {
+        results['fetch_chatgpt'] = { ok: false, error: e.message };
+    }
+
+    return new Response(JSON.stringify({
+        version: '4.3',
+        timestamp: new Date().toISOString(),
+        cf: { colo: request.cf?.colo, country: request.cf?.country },
+        tests: results
+    }, null, 2), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+}
+
+function timeout(ms) {
+    return new Promise((_, reject) => setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms));
 }
 
 // ==================== VLESS WebSocket 处理 ====================
@@ -96,7 +176,7 @@ async function vlessOverWSHandler(request) {
     let address = '';
     let portWithRandomLog = '';
     const log = (info, event) => {
-        console.log(`[v4.2] [${address}:${portWithRandomLog}] ${info}`, event || '');
+        console.log(`[v4.3] [${address}:${portWithRandomLog}] ${info}`, event || '');
     };
 
     const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
@@ -129,7 +209,7 @@ async function vlessOverWSHandler(request) {
 
             if (result.hasError) {
                 log('VLESS header error:', result.message);
-                webSocket.close(1008, result.message);
+                sendClose(webSocket, 1008, result.message);
                 return;
             }
 
@@ -145,14 +225,13 @@ async function vlessOverWSHandler(request) {
                     udpStreamWrite = write;
                     udpStreamWrite(result.rawClientData);
                 } else {
-                    webSocket.close(1008, 'UDP only for DNS');
+                    sendClose(webSocket, 1008, 'UDP only for DNS');
                 }
                 return;
             }
 
             const vlessResponseHeader = new Uint8Array([result.vlessVersion[0], 0]);
             
-            // 核心：处理 TCP 出站连接
             await handleTCPOutBound(
                 remoteSocketWrapper,
                 address,
@@ -171,7 +250,7 @@ async function vlessOverWSHandler(request) {
         },
     })).catch((err) => {
         log('pipeTo error:', err.stack || err);
-        try { webSocket.close(1011, 'Internal error'); } catch(e) {}
+        sendClose(webSocket, 1011, 'Internal error: ' + err.message);
     });
 
     return new Response(null, {
@@ -181,114 +260,131 @@ async function vlessOverWSHandler(request) {
     });
 }
 
-// ==================== TCP 出站处理（v4.2 核心修复）====================
+// ==================== TCP 出站处理（v4.3 核心改进）====================
 
 async function handleTCPOutBound(remoteSocketWrapper, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log) {
     const startTime = Date.now();
     
-    // 选择目标地址
-    let targetAddress;
-    if (FORCE_PROXY_MODE) {
-        targetAddress = currentProxyIP;
-        log(`FORCE_PROXY_MODE: using ProxyIP ${targetAddress} for ${addressRemote}`);
-    } else {
-        targetAddress = addressRemote;
-        log(`Direct mode: connecting to ${addressRemote}`);
+    // ★ v4.3 核心改进：尝试多种连接方式
+    const connectMethods = [
+        {
+            name: 'direct',
+            desc: `直连 ${addressRemote}:${portRemote}`,
+            fn: () => connect({ hostname: addressRemote, port: portRemote })
+        },
+        ...(FORCE_PROXY_MODE ? [{
+            name: 'proxyip',
+            desc: `ProxyIP ${currentProxyIP}:${portRemote}`,
+            fn: () => connect({ hostname: currentProxyIP, port: portRemote })
+        }] : [])
+    ];
+
+    let lastError = null;
+    let tcpSocket = null;
+
+    for (const method of connectMethods) {
+        try {
+            log(`[${method.name}] 尝试 ${method.desc}...`);
+            
+            tcpSocket = method.fn();
+
+            // 等待连接建立
+            const openResult = await Promise.race([
+                tcpSocket.opened,
+                new Promise((_, reject) => setTimeout(() => reject(new Error('connect timeout')), CONNECT_TIMEOUT))
+            ]);
+            
+            const connectTime = Date.now() - startTime;
+            log(`[${method.name}] ✓ 连接成功! (${connectTime}ms) remoteAddress=${openResult.remoteAddress}`);
+
+            // 连接成功，开始数据转发
+            remoteSocketWrapper.value = tcpSocket;
+
+            // 写入客户端数据
+            log(`[${method.name}] 写入 ${rawClientData.length} bytes...`);
+            const writer = tcpSocket.writable.getWriter();
+            await writer.write(rawClientData);
+            writer.releaseLock();
+            log(`[${method.name}] 数据写入完成`);
+
+            // 开始将远程数据转发回 WebSocket
+            await tcpSocket.readable.pipeTo(
+                new WritableStream({
+                    async write(chunk) {
+                        const elapsed = Date.now() - startTime;
+                        log(`[${method.name}] 收到 ${chunk.length} bytes (${elapsed}ms)`);
+                        
+                        if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+                            log(`[${method.name}] WS 已关闭，丢弃数据`);
+                            return;
+                        }
+                        
+                        try {
+                            if (vlessResponseHeader) {
+                                webSocket.send(await new Blob([vlessResponseHeader, chunk]).arrayBuffer());
+                            } else {
+                                webSocket.send(chunk);
+                            }
+                        } catch(e) {
+                            log(`[${method.name}] 发送到 WS 错误:`, e.message);
+                        }
+                    },
+                    close() {
+                        const elapsed = Date.now() - startTime;
+                        log(`[${method.name}] 远程关闭 (${elapsed}ms)`);
+                        safeCloseWebSocket(webSocket);
+                    },
+                    abort(reason) {
+                        log(`[${method.name}] 远程中止:`, reason);
+                        safeCloseWebSocket(webSocket);
+                    },
+                })
+            ).catch((error) => {
+                log(`[${method.name}] pipeTo 错误:`, error.message || error);
+                safeCloseWebSocket(webSocket);
+            });
+
+            // 正常返回（pipeTo 完成或出错都会在上面的 catch 中处理）
+            return;
+
+        } catch(error) {
+            lastError = error;
+            const elapsed = Date.now() - startTime;
+            log(`[${method.name}] ✗ 失败 (${elapsed}ms): ${error.message}`);
+
+            if (tcpSocket) {
+                try { tcpSocket.close(); } catch(e) {}
+                tcpSocket = null;
+            }
+        }
     }
 
-    let tcpSocket = null;
+    // 所有方式都失败
+    const errMsg = `ALL_FAILED: ${connectMethods.map(m => m.name).join(',')} | last=${lastError?.message || 'unknown'} (${Date.now()-startTime}ms)`;
+    log(`FATAL: ${errMsg}`);
     
+    sendClose(webSocket, 1011, errMsg);
+}
+
+// ==================== 安全的 Close 函数 ====================
+
+function sendClose(ws, code, reason) {
     try {
-        log(`Step 1: connect(${targetAddress}:${portRemote})...`);
+        // 确保 reason 长度不超过 WebSocket 协议限制 (125 bytes)
+        const reasonStr = typeof reason === 'string' ? reason : String(reason || '');
+        const truncatedReason = reasonStr.length > 125 ? reasonStr.substring(0, 125) : reasonStr;
         
-        // 创建 TCP 连接
-        // 注意：Cloudflare Workers 的 connect() 不支持 serverName 参数
-        // SocketOptions 只有 secureTransport 和 allowHalfOpen
-        tcpSocket = connect({
-            hostname: targetAddress,
-            port: portRemote,
-        });
-
-        log(`Step 2: socket created, waiting for opened...`);
-        
-        // ★ 关键修复：等待连接真正建立！
-        const openResult = await Promise.race([
-            tcpSocket.opened,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('connect timeout')), CONNECT_TIMEOUT))
-        ]);
-        
-        const connectTime = Date.now() - startTime;
-        log(`Step 3: Connection established in ${connectTime}ms! remoteAddress=${openResult.remoteAddress}`);
-
-        remoteSocketWrapper.value = tcpSocket;
-
-        // 写入客户端数据
-        log(`Step 4: Writing ${rawClientData.length} bytes to remote...`);
-        const writer = tcpSocket.writable.getWriter();
-        await writer.write(rawClientData);
-        writer.releaseLock();
-        log(`Step 5: Data written OK`);
-
-        // 设置读取超时
-        const dataTimeoutId = setTimeout(() => {
-            log(`WARNING: No data received within ${DATA_TIMEOUT}ms, closing`);
-            safeCloseWebSocket(webSocket);
-        }, DATA_TIMEOUT);
-
-        // 开始将远程数据转发回 WebSocket
-        log(`Step 6: Starting pipeTo from remote to WS...`);
-        
-        await tcpSocket.readable.pipeTo(
-            new WritableStream({
-                start() {
-                    clearTimeout(dataTimeoutId);
-                    log('pipeTo started, data timeout cleared');
-                },
-                async write(chunk) {
-                    const elapsed = Date.now() - startTime;
-                    log(`Received ${chunk.length} bytes from remote (${elapsed}ms total)`);
-                    
-                    if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-                        log('WARNING: WebSocket not open, discarding chunk');
-                        return;
-                    }
-                    
-                    try {
-                        // 发送 VLESS 响应头 + 数据
-                        if (vlessResponseHeader) {
-                            webSocket.send(await new Blob([vlessResponseHeader, chunk]).arrayBuffer());
-                            log('Sent with VLESS response header');
-                        } else {
-                            webSocket.send(chunk);
-                        }
-                    } catch(e) {
-                        log('Error sending to WS:', e.message);
-                    }
-                },
-                close() {
-                    const elapsed = Date.now() - startTime;
-                    log(`remote readable closed after ${elapsed}ms`);
-                    safeCloseWebSocket(webSocket);
-                },
-                abort(reason) {
-                    log(`remote readable aborted:`, reason);
-                    safeCloseWebSocket(webSocket);
-                },
-            })
-        ).catch((error) => {
-            log(`pipeTo error:`, error.stack || error);
-            safeCloseWebSocket(webSocket);
-        });
-
-    } catch(error) {
-        const elapsed = Date.now() - startTime;
-        log(`ERROR in handleTCPOutBound after ${elapsed}ms:`, error.message, error.stack);
-        
-        if (tcpSocket) {
-            try { tcpSocket.close(); } catch(e) {}
+        if (ws.readyState === WS_READY_STATE_OPEN) {
+            ws.close(code, truncatedReason);
+            return true;
         }
-        
-        safeCloseWebSocket(webSocket);
+        // 如果不是 open 状态，尝试强制关闭
+        try { ws.close(); } catch(e2) {}
+        return false;
+    } catch(e) {
+        // close 本身失败了
+        try { ws.close(); } catch(e2) {}
+        return false;
     }
 }
 
@@ -393,7 +489,7 @@ async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
             for (let i = 0; i < chunk.byteLength;) {
                 const len = new DataView(chunk.slice(i, i+2)).getUint16(0);
                 controller.enqueue(chunk.slice(i+2, i+2+len));
-                i += 2 + len;
+                i += len + 2;
             }
         }
     });
