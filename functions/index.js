@@ -57,9 +57,9 @@ export async function onRequest(context) {
     if (url.pathname === '/' || url.pathname === '/health') {
         return new Response(JSON.stringify({
             status: 'ok',
-            service: 'VLESS Proxy v4.3',
-            version: '4.3',
-            fix: 'direct-connect fallback + better error reporting',
+            service: 'VLESS Proxy v4.4',
+            version: '4.4',
+            fix: 'fetch-test endpoint + connect() diagnostic',
             uuid: UUID,
             domain: url.hostname,
             proxy_mode: FORCE_PROXY_MODE ? 'force' : 'fallback',
@@ -69,6 +69,33 @@ export async function onRequest(context) {
         }), {
             status: 200,
             headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*' }
+        });
+    }
+
+    // fetch API 测试（用于验证 fetch 是否可用作 connect 替代）
+    if (url.pathname === '/fetch-test') {
+        const results = {};
+        const targets = [
+            ['google_http',  'http://www.google.com/generate_204'],
+            ['chatgpt_http', 'http://chatgpt.com/'],
+            ['cloudflare',   'https://cloudflare.com/', true],
+            ['twitter',      'https://x.com/',          true],
+        ];
+        for (const [name, urlStr, noRedirect] of targets) {
+            try {
+                const t0 = Date.now();
+                const r = await fetch(urlStr, {
+                    method: 'HEAD',
+                    redirect: noRedirect ? 'manual' : 'follow',
+                    headers: { 'User-Agent': 'curl/8.0' }
+                });
+                results[name] = { ok: true, status: r.status, ms: Date.now() - t0 };
+            } catch(e) {
+                results[name] = { ok: false, error: e.message };
+            }
+        }
+        return new Response(JSON.stringify({ version: '4.4', tests: results }, null, 2), {
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
         });
     }
 
